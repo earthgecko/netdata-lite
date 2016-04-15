@@ -1,0 +1,93 @@
+#!/bin/bash
+####    netdata-lite    ####
+#
+# @author Gary Wilson (@earthgecko)
+# @created 20160416
+# @modified
+# @license GPL v3 - http://www.gnu.org/licenses/gpl-3.0.en.html
+# @source https://github.com/earthgecko/netdata-lite/etc/init.d/netdata-lite
+#
+# chkconfig: 2345 90 60
+# description: netdata-lite is a program that runs nc on port 19999 and if a \
+#              a request is made starts netdata.
+
+if [ ! -f /etc/redhat-release ]; then
+  echo "error: this netdata-lite init is for RedHat flavour family only"
+  exit 1
+fi
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+prog="netdata-lite"
+PROG_SCRIPT="/usr/sbin/$prog"
+# You can add the PROG_SCRIPT variable to then netdata-lite.conf file if you
+# want to run it under a different path
+
+# Source he netdata-lite config
+if [ -f /etc/netdata/netdata-lite.conf ]; then
+  . /etc/netdata/netdata-lite.conf
+fi
+
+lockfile="/var/run/$prog.pid"
+
+start() {
+
+  echo -n $"Starting $prog: "
+
+  if [ -f $lockfile ]; then
+    LOCK_PID=$(cat "$lockfile")
+    echo "ERROR - $prog is already running with pid $LOCK_PID"
+    exit 5
+  fi
+  if [ ! -f $PROG_SCRIPT ]; then
+    echo "ERROR - $PROG_SCRIPT not found"
+    exit 6
+  fi
+  daemon "nohup $PROG_SCRIPT >/dev/null 2>&1 &"
+  retval=$?
+  echo
+  return $retval
+}
+
+stop() {
+  echo -n $"Stopping $prog: "
+  killproc $prog
+  retval=$?
+  echo
+  [ $retval -eq 0 ] && rm -f $lockfile
+  return $retval
+}
+
+restart() {
+  stop
+  start
+}
+
+rh_status() {
+  status $prog
+}
+
+rh_status_q() {
+  rh_status >/dev/null 2>&1
+}
+
+case "$1" in
+	start)
+		rh_status_q && exit 0
+		$1
+		;;
+	stop)
+		rh_status_q || exit 0
+		$1
+		;;
+	restart)
+		$1
+		;;
+	status)
+		rh_status
+		;;
+	*)
+		echo $"Usage: $0 {start|stop|restart|status}"
+		exit 2
+esac

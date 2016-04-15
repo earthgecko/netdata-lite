@@ -1,0 +1,247 @@
+#!/bin/bash
+####    netdata-lite    ####
+#
+# @author Gary Wilson (@earthgecko)
+# @created 20160416
+# @modified
+# @license GPL v3 - http://www.gnu.org/licenses/gpl-3.0.en.html
+# @source https://github.com/earthgecko/netdata-lite/bin/netdata-lite
+#
+# Runs nc on netdata port on request start netdata
+# If monitoring loadavg, if 1min loadavg > x, start netdata
+# If netdata started run for declared seconds and stop and start nc
+
+if [ ! -f /etc/init.d/netdata ]; then
+  echo "error: netdata not found"
+  exit 1
+fi
+
+# Default variables which will be overridden by the netdata-lite.conf values
+# if present
+LOGFILE="/var/log/netdata/netdata-lite.log"
+PORT=19999
+NETDATA_LITE_ACCESS_LOG="/var/log/netdata/netdata-lite.access.log"
+MONITOR_LOADAVG="false"
+START_ON_LOADAVG=100
+RUN_NETDATA_FOR_SECONDS=3600
+
+# Override with variables declared in the config file if present
+if [ -f /etc/netdata/netdata-lite.conf ]; then
+  . /etc/netdata/netdata-lite.conf
+fi
+
+REDHAT=0
+DEBIAN=0
+if [ -f /etc/redhat-release ]; then
+  REDHAT=1
+fi
+
+PIDFILE_PATH="/var"
+if [ $REDHAT -eq 1 ]; then
+  PIDFILE_PATH="/var/run"
+fi
+if [ $DEBIAN -eq 1 ]; then
+  PIDFILE_PATH="/var"
+fi
+
+PIDFILE="${PIDFILE_PATH}/netdata-lite.pid"
+NC_PIDFILE="${PIDFILE_PATH}/netdata-lite.nc.pid"
+
+echo $$ > $PIDFILE
+
+if [ -f /etc/netdata/netdata-lite.conf ]; then
+  . /etc/netdata/netdata-lite.conf
+fi
+
+function start_nc_netdata_lite () {
+
+  NC_RUNNING=$(ps aux | grep -v grep | grep -c "nc -k -l ${PORT}")
+  if [ $NC_RUNNING -eq 1 ]; then
+    if [ ! -f "$NC_PIDFILE" ]; then
+      ps aux | grep -v grep | grep "nc -k -l ${PORT}" | tr -s ' ' ',' | cut -d',' -f2 > "$NC_PIDFILE"
+    fi
+    return 0
+  fi
+
+  > "$NETDATA_LITE_ACCESS_LOG"
+  while true ; do { read line<pipe;echo -e "HTTP/1.1 200 OK\r\n";echo -e "<head><meta http-equiv="refresh" content="6"></head><p>Starting netdata... within 6 seconds, this page auto refreshs</p>\r\n\r\n"; } | nc -k -l "$PORT" > pipe >> "$NETDATA_LITE_ACCESS_LOG"; done > /dev/null &
+  BG_PID=$!
+  echo "$BG_PID" > "${NC_PIDFILE}.bg"
+
+  NC_RUNNING=$(ps aux | grep -v grep | grep -c "nc -k -l ${PORT}")
+  if [ $NC_RUNNING -gt 0 ]; then
+    NC_PID=$(ps aux | grep -v grep | grep "nc -k -l $PORT" | tr -s ' ' ',' | cut -d',' -f2)
+    echo "$NC_PID" > "$NC_PIDFILE"
+    echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: started nc with pid $NC_PID" >> "$LOGFILE"
+    return 0
+  else
+    echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  ERROR: failed to start nc" >> "$LOGFILE"
+    return 0
+  fi
+
+}
+
+function stop_nc_netdata_lite () {
+
+  # kill nc pids
+  NC_PID=
+  if [ -f "${NC_PIDFILE}" ]; then
+    NC_PID=$(cat "$NC_PIDFILE")
+  fi
+  NC_RUNNING_PID=$(ps aux | grep -v grep | grep "nc -k -l ${PORT}" | tr -s ' ' ',' | cut -d',' -f2)
+  for i_pid in $(echo $NC_PID $NC_RUNNING_PID | sort | uniq)
+  do
+    VALID_NC_PID=$(ps aux | grep -v grep | grep "$i_pid" | grep -c "nc -k -l ${PORT}")
+    if [ $VALID_NC_PID -eq 1 ]; then
+      echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: stopping nc with pid $i_pid" >> "$LOGFILE"
+      kill "$i_pid" > /dev/null 2>&1
+      if [ "$i_pid" == "$NC_PID" ]; then
+        rm -f "$NC_PIDFILE"
+      fi
+    fi
+  done
+  rm -f "$NC_PIDFILE"
+
+  if [ -f "$NC_PIDFILE.bg" ]; then
+    BG_PID=$(cat "$NC_PIDFILE.bg")
+    VALID_BG_PID=$(ps aux | grep -v grep | grep "$BG_PID" | tr -s ' ' ',' |cut -d',' -f2 | grep -c "$BG_PID")
+    if [ $VALID_BG_PID -eq 1 ]; then
+      echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: stopping background pid $i_pid" >> "$LOGFILE"
+      kill "$BG_PID" > /dev/null 2>&1
+    fi
+    rm -f "$NC_PIDFILE.bg"
+  fi
+  return 0
+
+}
+
+function netdata_seconds_running () {
+
+  NETDATA_SECONDS_RUNNNING=0
+  NETDATA_RUNNING=$(ps u -U netdata | grep -v "grep\|USER" | wc -l)
+  if [ $NETDATA_RUNNING -eq 0 ]; then
+    return 0
+  fi
+  NETDATA_PID=$(ps u -U netdata | grep -v "grep\|USER" | grep netdata | grep pidfile | tr -s ' ' ',' | cut -d',' -f2)
+  NETDATA_TIMESTAMP=
+  if [ -f /var/run/netdata.pid ]; then
+    NETDATA_TIMESTAMP=$(stat --format=%Y /var/netdata.pid)
+  fi
+  if [ -f /var/netdata.pid ]; then
+    NETDATA_TIMESTAMP=$(stat --format=%Y /var/netdata.pid)
+  fi
+  if [ "$NETDATA_TIMESTAMP" == "" ]; then
+    NETDATA_TIMESTAMP=$(stat --format=%Y /proc/$NETDATA_PID/stat)
+  fi
+  TIME_NOW=$(date +%s)
+  NETDATA_SECONDS_RUNNNING=$((TIME_NOW-NETDATA_TIMESTAMP))
+  return 0
+
+}
+
+function stop {
+  echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: stop called" >> "$LOGFILE"
+  NC_RUNNING=$(ps aux | grep -v grep | grep -c "nc -k -l ${PORT}")
+  if [ $NC_RUNNING -eq 1 ]; then
+    echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: stopping nc" >> "$LOGFILE"
+    stop_nc_netdata_lite
+  fi
+  echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: removing $PIDFILE" >> "$LOGFILE"
+  rm -f $PIDFILE
+  echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: stopped" >> "$LOGFILE"
+  exit 0
+}
+
+echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: netdata-lite: started" >> "$LOGFILE"
+
+RUNNING=1
+while [ $RUNNING -eq 1 ]
+do
+
+  trap stop SIGINT SIGTERM
+
+# Only allow netdata to run for an hour
+  netdata_seconds_running
+  NETDATA_RUNNING=$NETDATA_SECONDS_RUNNNING
+
+  if [ $NETDATA_RUNNING -ne 0 ]; then
+    if [ $NETDATA_RUNNING -gt $RUN_NETDATA_FOR_SECONDS ]; then
+      echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: netdata running for ${NETDATA_RUNNING} seconds, stopping netdata" >> "$LOGFILE"
+      /etc/init.d/netdata stop >> "$LOGFILE"
+    else
+      sleep 60
+    fi
+  fi
+  test $NETDATA_RUNNING -eq 0 || continue
+
+# Check if nc is running
+  NC_RUNNING=$(ps aux | grep -v grep | grep -c "nc -k -l ${PORT}")
+  if [ $NC_RUNNING -eq 0 ]; then
+    echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: starting nc on ${PORT}" >> "$LOGFILE"
+    start_nc_netdata_lite
+    NC_RUNNING=$(ps aux | grep -v grep | grep -c "nc -k -l ${PORT}")
+  fi
+
+# Check if nc has logged any requests
+  if [ ! -f "$NETDATA_LITE_ACCESS_LOG" ]; then
+    touch "$NETDATA_LITE_ACCESS_LOG"
+  fi
+  NC_REQUEST_LINES=$(cat "$NETDATA_LITE_ACCESS_LOG" | wc -l)
+  if [ $NC_REQUEST_LINES -gt 0 ]; then
+    echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: netdata request recieved, stopping nc" >> "$LOGFILE"
+    stop_nc_netdata_lite
+    stop_nc_netdata_lite
+    NC_RUNNING=$(ps aux | grep -v grep | grep -c "nc -k -l ${PORT}")
+    if [ $NC_RUNNING -eq 1 ]; then
+      NC_RUNNING_PID=$(ps aux | grep -v grep | grep "nc -k -l ${PORT}" | tr -s ' ' ',' | cut -d',' -f2)
+      echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  ERROR: stopping nc, nc running on pid $NC_RUNNING_PID" >> "$LOGFILE"
+      stop_nc_netdata_lite
+    fi
+    sleep 1
+    echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: netdata request recieved, starting netdata" >> "$LOGFILE"
+    /etc/init.d/netdata start >> "$LOGFILE"
+    NETDATA_PID=$(ps u -U netdata | grep -v "grep\|USER" | grep "netdata" | grep pidfile | tr -s ' ' ',' | cut -d',' -f2)
+    if [ "$NETDATA_PID" == "" ]; then
+      echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  WARN: netdata did not start, restarting netdata" >> "$LOGFILE"
+      sleep 5
+      /etc/init.d/netdata restart >> "$LOGFILE"
+      NETDATA_PID=$(ps u -U netdata | grep -v "grep\|USER" | grep "netdata" | grep pidfile | tr -s ' ' ',' | cut -d',' -f2)
+    fi
+    if [ "$NETDATA_PID" != "" ]; then
+      NETDATA_RUNNING=1
+      echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: started netdata" >> "$LOGFILE"
+    else
+      TRIES=0
+      while [ $TRIES -lt 5 ]
+      do
+        TRIES=$((TRIES+1))
+        echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  WARN: netdata did not start, restarting netdata" >> "$LOGFILE"
+        sleep 5
+        /etc/init.d/netdata restart >> "$LOGFILE"
+        NETDATA_PID=$(ps u -U netdata | grep -v "grep\|USER" | grep "netdata" | grep pidfile | tr -s ' ' ',' | cut -d',' -f2)
+        if [ "$NETDATA_PID" == "" ]; then
+          TRIES=$((TRIES+NETDATA_PID))
+          NETDATA_RUNNING=1
+        fi
+      done
+    fi
+  fi
+
+  if [[ $NETDATA_RUNNING -eq 0 && "$MONITOR_LOADAVG" == "true" ]]; then
+    ONE_MINUTE_LOADAVG=$(cat /proc/loadavg | cut -d' ' -f1)
+    LOADAVG_OK=$(echo $ONE_MINUTE_LOADAVG'>'$START_ON_LOADAVG | bc -l)
+    if [ $LOADAVG_OK -eq 1 ]; then
+      if [ $NC_RUNNING -gt 0 ]; then
+        echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: loadavg is greater than $START_ON_LOADAVG, currently $ONE_MINUTE_LOADAVG, stopping nc and starting netdata" >> "$LOGFILE"
+        stop_nc_netdata_lite
+        /etc/init.d/netdata start >> "$LOGFILE"
+        echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: loadavg threshold exceeded, starting netdata" >> "$LOGFILE"
+        NETDATA_RUNNING=1
+        echo "$(date +'%Y-%m-%d %H:%M:%S'): [$$] -  INFO: started netdata" >> "$LOGFILE"
+      fi
+    fi
+  fi
+
+  sleep 3
+
+done
